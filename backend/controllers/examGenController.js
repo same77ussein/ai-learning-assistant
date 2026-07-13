@@ -450,7 +450,7 @@ Mix the question types evenly.\n\nDocument:\n${context}`,
       title,
       questions,
       difficulty: diff,
-      status: "completed",
+      status: "pending",
     });
 
     await Activity.create({
