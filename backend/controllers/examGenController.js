@@ -4,6 +4,10 @@ const Activity = require("../models/Activity");
 const config = require("../config/env");
 const { isRetryableGeminiError } = require("../utils/geminiRetry");
 
+const MAX_EXAM_CONTEXT_CHARS = 25000;
+const GEMINI_TOTAL_TIMEOUT_MS = 20000;
+const GEMINI_PER_MODEL_TIMEOUT_MS = 7000;
+
 const LOCAL_EXAMS = {
   easy: {
     title: "Fundamentals: Quick Knowledge Check",
@@ -331,7 +335,7 @@ exports.generate = async (req, res) => {
     const context = docs
       .map((d) => d.content || "")
       .join("\n\n")
-      .substring(0, 50000);
+      .substring(0, MAX_EXAM_CONTEXT_CHARS);
     const docTitles = docs.map((d) => d.title).join(", ");
 
     let title, questions;
@@ -342,21 +346,32 @@ exports.generate = async (req, res) => {
       title = local.title;
     } else {
       const models = config.GEMINI_MODELS;
+      const startedAt = Date.now();
 
       async function tryModel(idx) {
         if (idx >= models.length) return null;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= GEMINI_TOTAL_TIMEOUT_MS) return null;
+
         const model = models[idx];
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.GEMINI_API_KEY}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: `Create a ${diff} difficulty exam with ${numQ} questions from this document. Include a MIX of question types:
+        const timeoutMs = Math.min(
+          GEMINI_PER_MODEL_TIMEOUT_MS,
+          GEMINI_TOTAL_TIMEOUT_MS - elapsed,
+        );
+        let response;
+        try {
+          response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.GEMINI_API_KEY}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal: AbortSignal.timeout(timeoutMs),
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [
+                      {
+                        text: `Create a ${diff} difficulty exam with ${numQ} questions from this document. Include a MIX of question types:
 - "multiple-choice" (4 options)
 - "true-false" (2 options: ["True", "False"])
 - "short-answer" (no options, user types the answer)
@@ -379,13 +394,17 @@ For true-false: type is "true-false", options are ["True", "False"], correctAnsw
 For short-answer: type is "short-answer", options is an empty array, correctAnswer is a string (the expected answer), explanation provides context.
 
 Mix the question types evenly.\n\nDocument:\n${context}`,
-                    },
-                  ],
-                },
-              ],
-            }),
-          },
-        );
+                      },
+                    ],
+                  },
+                ],
+              }),
+            },
+          );
+        } catch (err) {
+          console.error(`Gemini request failed (${model}):`, err.message);
+          return tryModel(idx + 1);
+        }
         const data = await response.json();
         if (!response.ok && isRetryableGeminiError(response, data))
           return tryModel(idx + 1);
@@ -431,7 +450,7 @@ Mix the question types evenly.\n\nDocument:\n${context}`,
       title,
       questions,
       difficulty: diff,
-      status: "pending",
+      status: "completed",
     });
 
     await Activity.create({
@@ -513,7 +532,7 @@ exports.clearResult = async (req, res) => {
     const exam = await Exam.findOne({ _id: req.params.id, user: req.user.id });
     if (!exam) return res.status(404).json({ message: "Exam not found." });
     exam.result = undefined;
-    exam.status = "pending";
+    exam.status = "completed";
     await exam.save();
     res.json(exam);
   } catch (err) {
